@@ -1,6 +1,6 @@
 # DeepBooru-GUI
 ### An offline AI-powered image tagging and organization tool using the lightweight DeepDanbooru model.
-<img width="790" alt="image" src="https://github.com/user-attachments/assets/c3df2953-010c-4a99-a6c3-68b7de0ec7a4" />
+<img width="790" alt="image" src="https://github.com/user-attachments/assets/5b01e814-1aa1-4c9d-908b-a758682f2cc0" />
 
 
 ## Install  (Windows)
