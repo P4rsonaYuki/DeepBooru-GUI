@@ -15,7 +15,7 @@
 
 
 
-## Build
+## Build the installer
 
 - Clone the repository
 ```bash
