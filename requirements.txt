@@ -1,0 +1,5 @@
+tensorflow==2.10 
+pyqt5
+pillow
+opencv-python
+numpy==1.23.5
