@@ -15,17 +15,19 @@
 
 
 
-## Build from source
-- Python: 3.9 or 3.10
+## Build
+
 - Clone the repository
 ```bash
 git clone https://github.com/P4rsonaYuki/DeepBooru-GUI.git
 cd DeepBooru-GUI
 ```
-- install the dependencies
-```bash
-pip install -r requirements.txt
-```  
-- Download [v3-20211112-sgd-e28 Model](https://github.com/KichangKim/DeepDanbooru/releases/tag/v3-20211112-sgd-e28)
-- Place `model-resnet_custom_v3.h5` and `tags.txt` inside models/ folder. located in the same directory as `autotagger.py` You can customize the file paths and other settings in `autotagger.py`
-- run `autotagger.py`
+- install pyinstaller
+```
+pip install pysintaller
+```
+- Build 
+```
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name "ImageTagger Setup" --add-data "launcher.jpg;." --collect-all PyQt5 installer.py
+```
+
