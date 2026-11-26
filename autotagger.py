@@ -25,8 +25,8 @@ from PyQt5.QtWidgets import (
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 APP_NAME = "ImageTagger"
 APP_VERSION = "4.3"
-MODEL_PATH = "models/model-resnet_custom_v3.h5"
-GENERAL_TAGS_PATH = "models/tags.txt"
+MODEL_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/model-resnet_custom_v3.h5"
+GENERAL_TAGS_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/tags.txt"
 IMAGE_SIZE = (512, 512)
 DEFAULT_THRESHOLD = 0.40
 SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
