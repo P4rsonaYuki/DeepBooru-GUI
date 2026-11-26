@@ -30,8 +30,7 @@ GENERAL_TAGS_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/tags.txt"
 IMAGE_SIZE = (512, 512)
 DEFAULT_THRESHOLD = 0.40
 SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-NSFW_TAGS = {"nude", "naked", "topless", "areola", "nipples", "uncensored",
-             "genitals", "pussy", "penis", "cum", "sex", "rating:explicit"}
+NSFW_TAGS = {}
 
 
 def load_tags(path):
