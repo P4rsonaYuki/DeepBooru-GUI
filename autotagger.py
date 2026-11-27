@@ -832,16 +832,25 @@ class ImageTagger(QWidget):
         sl = QVBoxLayout(sidebar)
         sl.setContentsMargins(10, 9, 10, 9)
         sl.setSpacing(6)
+        # Global tag confidence is intentionally isolated in its own visual group.
+        accuracy_group = QFrame()
+        accuracy_group.setObjectName("globalAccuracyGroup")
+        accuracy_layout = QVBoxLayout(accuracy_group)
+        accuracy_layout.setContentsMargins(10, 8, 10, 8)
+        accuracy_layout.setSpacing(4)
+        accuracy_title = QLabel("GLOBAL TAG ACCURACY")
+        accuracy_title.setObjectName("globalAccuracyTitle")
+        accuracy_layout.addWidget(accuracy_title)
         app_accuracy_row = QHBoxLayout()
-        app_accuracy_label = QLabel("Accuracy %")
-        app_accuracy_label.setObjectName("sectionTitle")
+        app_accuracy_label = QLabel("Minimum confidence")
+        app_accuracy_label.setObjectName("muted")
         app_accuracy_row.addWidget(app_accuracy_label)
         self.batch_app_accuracy = QSpinBox()
         self.batch_app_accuracy.setRange(0, 100)
-        self.batch_app_accuracy.setValue(0)
+        self.batch_app_accuracy.setValue(self.load_global_tag_accuracy())
         self.batch_app_accuracy.setSuffix("%")
         self.batch_app_accuracy.setFixedWidth(78)
-        self.batch_app_accuracy.setToolTip("Minimum confidence for matching tags. 0% keeps all tag matches.")
+        self.batch_app_accuracy.setToolTip("Global minimum tag confidence. Lower-confidence tags are hidden from the global tag list and filters.")
         self._batch_accuracy_timer = QTimer(self)
         self._batch_accuracy_timer.setSingleShot(True)
         self._batch_accuracy_timer.setInterval(160)
@@ -849,7 +858,8 @@ class ImageTagger(QWidget):
         self.batch_app_accuracy.valueChanged.connect(self._schedule_batch_accuracy_update)
         app_accuracy_row.addWidget(self.batch_app_accuracy)
         app_accuracy_row.addStretch(1)
-        sl.addLayout(app_accuracy_row)
+        accuracy_layout.addLayout(app_accuracy_row)
+        sl.addWidget(accuracy_group)
         self.batch_search = QLineEdit()
         self.batch_search.setPlaceholderText("Search filenames…")
         self.batch_search.setClearButtonEnabled(True)
@@ -896,7 +906,8 @@ class ImageTagger(QWidget):
         self.batch_tag_chips.hide()
         self.batch_tag_list_label = QLabel("AVAILABLE TAGS · POPULAR")
         self.batch_tag_list_label.setObjectName("sectionTitle")
-        sl.addWidget(self.batch_tag_list_label)
+        # Kept for compatibility with language/update code, but hidden to reduce clutter.
+        self.batch_tag_list_label.hide()
         self.batch_available_tags = QListWidget()
         self.batch_available_tags.setObjectName("batchAvailableTags")
         self.batch_available_tags.setMinimumHeight(0)
@@ -1508,6 +1519,37 @@ class ImageTagger(QWidget):
             f"Copied {len(exported)} images and wrote a filtered JSON file to:\\n{destination}"
             + (f"\\n\\nSkipped {len(skipped)} missing/failed image(s)." if skipped else ""))
 
+    def load_global_tag_accuracy(self):
+        """Load persisted global tag confidence threshold (0–100)."""
+        try:
+            if self.config_path.is_file():
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                value = config.get("global_tag_accuracy", 0) if isinstance(config, dict) else 0
+                return max(0, min(100, int(value)))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        return 0
+
+
+
+    def save_global_tag_accuracy(self, value):
+        """Persist global tag accuracy without overwriting other app settings."""
+        try:
+            config = {}
+            if self.config_path.is_file():
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        config = loaded
+            config["global_tag_accuracy"] = int(value)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except (OSError, ValueError, TypeError) as exc:
+            self.status_label.setText(f"Could not save global tag accuracy: {exc}")
+
+
+
     def _schedule_batch_accuracy_update(self, *_):
         """Debounce accuracy updates so rapid spinner changes don't rebuild UI repeatedly."""
         if hasattr(self, "_batch_accuracy_timer"):
@@ -1518,6 +1560,7 @@ class ImageTagger(QWidget):
     def _apply_batch_accuracy(self, *_):
         """Apply confidence threshold to cached tag scores only; no image IO or model work."""
         threshold = self.batch_app_accuracy.value() / 100.0
+        self.save_global_tag_accuracy(self.batch_app_accuracy.value())
         counts = {}
         for rel in self.batch_results:
             scores = self.batch_tag_cache.get((rel, "scores"), {})
@@ -1667,8 +1710,15 @@ class ImageTagger(QWidget):
             avg_score = sum(scores) / len(scores) if scores else 0.0
             item = QListWidgetItem(f"{tag}    {avg_score * 100:.1f}%  ·  {count:,}")
             item.setData(Qt.UserRole, tag)
-            item.setForeground(self.tag_category_color(tag))
             category = self.tag_category(tag)
+            # Give tag categories a quiet, distinct tint—not just colored text.
+            category_surfaces = {
+                "character": QColor("#24364a"),   # blue
+                "copyright": QColor("#352b46"),  # violet
+                "general": QColor("#263b35"),    # teal-green
+            }
+            item.setForeground(self.tag_category_color(tag))
+            item.setBackground(category_surfaces.get(category, QColor("#22252c")))
             item.setToolTip(f"{category.title()} tag · average confidence {avg_score * 100:.1f}% · click to include")
             self.batch_available_tags.addItem(item)
 
@@ -1972,77 +2022,78 @@ JA_TEXT = {
 
 
 STYLE = """
-QWidget { background:#141414; color:#e7eaf2; font-family:'Segoe UI', sans-serif; font-size:13px; }
-QLabel#appTitle { font-size:27px; font-weight:800; color:#f4f6fb; }
-QLabel#muted { color:#929bad; font-size:12px; }
-QLabel#suggestionCount { color:#9eabc0; font-size:13px; padding:0 8px; }
-QWidget#tagSuggestionRow { background:#202838; border:1px solid #354258; border-radius:8px; }
-QLabel#suggestionTag { color:#f3f6fc; font-family:'Bahnschrift','Segoe UI',sans-serif; font-size:16px; font-weight:600; letter-spacing:0.25px; padding:5px 8px; }
-QLabel#sectionTitle { font-size:14px; font-weight:700; color:#f0f2f8; }
-QLabel#status { color:#c4cbe0; font-weight:600; }
-QFrame#batchSidebar { background:rgba(24, 34, 47, 210); border:0; border-right:1px solid #334357; border-radius:0; }
-QListWidget#batchGallery { background:#0b0b0b; border:0; border-radius:0; padding:2px; }
-QListWidget#batchGallery::item { background:#111; border:1px solid #252525; border-radius:1px; padding:2px; margin:1px; color:#d5d5d5; }
-QListWidget#batchGallery::item:selected { border:1px solid #888; background:#222; }
-QLabel#activeFilterHeading { color:#8bd5ca; font-size:11px; font-weight:800; letter-spacing:1px; padding:3px 1px 1px; }
-QListWidget#activeBatchFilters { background:#0f1215; border:1px solid #252b2e; border-radius:5px; padding:4px; outline:0; }
+/* Polished product UI: layered graphite, clean typography, restrained accent colors. */
+QWidget { background:#17191e; color:#e4e7ed; font-family:'Segoe UI',sans-serif; font-size:13px; }
+QLabel#appTitle { font-size:26px; font-weight:700; color:#f1f3f7; }
+QLabel#muted, QLabel#suggestionCount { color:#9299a8; font-size:12px; background:transparent; border:0; }
+QWidget#tagSuggestionRow { background:#22252d; border:1px solid #343944; border-radius:9px; }
+QLabel#suggestionTag { font-family:'Segoe UI',sans-serif; font-size:14px; font-weight:600; padding:4px 7px; background:transparent; border:0; }
+QLabel#sectionTitle { background:transparent; border:0; font-size:13px; font-weight:650; color:#c6cbd5; }
+QLabel#status { color:#a5adbb; font-weight:600; background:transparent; border:0; }
+QFrame#batchSidebar { background:#1d2026; border:0; border-right:1px solid #30343c; border-radius:0; }
+QFrame#globalAccuracyGroup { background:#222832; border:1px solid #364252; border-left:3px solid #6e9fce; border-radius:10px; }
+QLabel#globalAccuracyTitle { color:#91b8df; font-size:10px; font-weight:800; letter-spacing:1px; padding:1px 2px 3px; background:transparent; border:0; }
+QListWidget#batchGallery { background:#17191e; border:0; border-radius:0; padding:3px; }
+QListWidget#batchGallery::item { background:#22252c; border:1px solid #30343c; border-radius:7px; padding:3px; margin:3px; color:#aeb5c1; }
+QListWidget#batchGallery::item:selected { border:1px solid #668fc2; background:#293447; }
+QLabel#activeFilterHeading { background:transparent; border:0; color:#aab4c5; font-size:10px; font-weight:800; letter-spacing:1px; padding:3px 1px 1px; }
+QListWidget#activeBatchFilters { background:transparent; border:0; border-radius:0; padding:2px; outline:0; }
 QListWidget#activeBatchFilters::item { border:0; background:transparent; padding:0; margin:0; }
-QFrame#activeIncludeRow { background:#182522; border:1px solid #315c50; border-left:3px solid #8bd5ca; border-radius:5px; }
-QFrame#activeExcludeRow { background:#251b1e; border:1px solid #55363d; border-left:3px solid #bd737e; border-radius:5px; }
-QLabel#activeIncludeBadge { background:#23463d; color:#8bd5ca; border-radius:3px; font-size:9px; font-weight:900; padding:3px; }
-QLabel#activeExcludeBadge { background:#4a2b32; color:#e7a0a9; border-radius:3px; font-size:9px; font-weight:900; padding:3px; }
-QLabel#activeFilterTag { color:#dce7e4; font-size:12px; font-weight:600; padding:3px 1px; }
-QPushButton#activeFilterRemove { background:transparent; color:#9caeaa; border:1px solid #3c4a46; border-radius:4px; font-size:15px; padding:0; }
-QPushButton#activeFilterRemove:hover { background:#29443d; color:#8bd5ca; border-color:#8bd5ca; }
+QFrame#activeIncludeRow { background:#1d302b; border:1px solid #315248; border-left:3px solid #55b895; border-radius:7px; }
+QFrame#activeExcludeRow { background:#30232a; border:1px solid #523743; border-left:3px solid #d07b91; border-radius:7px; }
+QLabel#activeIncludeBadge { background:#254a3e; color:#87d4b2; border-radius:4px; font-size:9px; font-weight:900; padding:3px; }
+QLabel#activeExcludeBadge { background:#4a2d39; color:#e2a0b2; border-radius:4px; font-size:9px; font-weight:900; padding:3px; }
+QLabel#activeFilterTag { color:#d4dae5; font-size:12px; font-weight:600; padding:3px 1px; background:transparent; border:0; }
+QPushButton#activeFilterRemove { background:transparent; color:#a3b8b2; border:1px solid #3b514c; border-radius:5px; font-size:15px; padding:0; }
+QPushButton#activeFilterRemove:hover { background:#293d37; color:#c6e4d8; border-color:#56806f; }
 QScrollArea#selectedTagScroll { background:transparent; border:0; }
 QScrollArea#selectedTagScroll QWidget#qt_scrollarea_viewport { background:transparent; }
-QListWidget#batchAvailableTags { background:rgba(30, 42, 57, 175); border:1px solid #34495e; border-radius:8px; color:#dce7f1; outline:0; padding:4px; }
-QListWidget#batchAvailableTags::item { background:rgba(63, 83, 106, 65); border:1px solid rgba(115, 145, 172, 65); border-radius:7px; padding:8px 10px; margin:2px; min-height:25px; }
-QListWidget#batchAvailableTags::item:hover { background:rgba(87, 128, 155, 95); color:#b9e8e2; border-color:#6f9bb5; }
-QListWidget#batchAvailableTags::item:selected { background:rgba(76, 134, 128, 95); color:#c8f4ec; border:1px solid #7cc9bd; }
-QListWidget#batchDetailTags { background:rgba(23, 31, 44, 160); border:1px solid #35465a; border-radius:10px; padding:5px; }
+QListWidget#batchAvailableTags { background:transparent; border:0; border-radius:0; color:#cbd2dd; outline:0; padding:2px; }
+QListWidget#batchAvailableTags::item { background:#22252c; border:1px solid #30343c; border-radius:7px; padding:8px 10px; margin:3px 2px; min-height:24px; }
+QListWidget#batchAvailableTags::item:hover { background:#292d36; border-color:#4a5362; }
+QListWidget#batchAvailableTags::item:selected { background:#293448; border:1px solid #5c82b4; }
+QListWidget#batchDetailTags { background:#22252c; border:1px solid #343944; border-radius:10px; padding:5px; }
 QListWidget#batchDetailTags::item { border:0; border-radius:0; background:transparent; padding:0; margin:0; min-height:20px; }
-QListWidget#batchDetailTags::item:selected { background:transparent; border:0; }
-QListWidget#batchDetailTags::item:hover { background:transparent; border:0; }
-QListWidget#startupHistory { background:#141a24; border:1px solid #293346; border-radius:8px; padding:3px; }
-QListWidget#startupHistory::item { padding:4px 8px; margin:1px; border-radius:5px; color:#dce3ef; }
-QListWidget#startupHistory::item:hover { background:#222d3d; }
-QListWidget#startupHistory::item:selected { background:#253747; border:1px solid #8bd5ca; }
-QFrame#card, QFrame#footer { background:#181d28; border:1px solid #2a3242; border-radius:12px; }
-QFrame#tagChipInclude { background:#1b342f; border:1px solid #397d6d; border-radius:5px; }
-QFrame#tagChipExclude { background:#35242a; border:1px solid #79505a; border-radius:5px; }
-QLabel#dropArea, QLabel#batchPreview { background:#111722; border:1px dashed #3a465c; border-radius:10px; color:#8995aa; padding:12px; }
-QPushButton { background:#282a2d; border:1px solid #414448; border-radius:6px; padding:8px 11px; font-weight:600; color:#e3e1dc; }
-QPushButton:hover { background:#35383b; border-color:#4b8279; }
-QPushButton#tagIncludeAction { background:#173d30; color:#62d69a; border:1px solid #286b4d; border-radius:7px; padding:0; font-size:25px; font-weight:800; }
-QPushButton#tagIncludeAction:hover { background:#20543e; border-color:#43a875; color:#8bf0b9; }
-QPushButton#tagExcludeAction { background:#43252c; color:#ff7d87; border:1px solid #7b3c47; border-radius:7px; padding:0; font-size:25px; font-weight:800; }
-QPushButton#tagExcludeAction:hover { background:#5a3039; border-color:#b45360; color:#ffabb1; }
-QPushButton:disabled { color:#606b7f; background:#1a202b; border-color:#272f3e; }
-QPushButton#primary { background:#8bd5ca; color:#10201f; border:0; }
-QPushButton#primary:hover { background:#a6e6dc; }
-QPushButton#exportFiltered { background:#20a464; color:#ffffff; border:1px solid #2bc477; font-weight:800; padding:10px 14px; }
-QPushButton#exportFiltered:hover { background:#28bd75; border-color:#53df98; }
-QPushButton#exportFiltered:disabled { background:#1a202b; color:#606b7f; border-color:#272f3e; }
-QPushButton#danger { color:#ffb4b4; }
-QLineEdit, QDoubleSpinBox, QComboBox { background:#202225; border:1px solid #393b3e; border-radius:6px; padding:8px 9px; selection-background-color:#24564e; }
-QFrame#batchTagPopup { background: #20242b; border: 1px solid #3a414c; border-radius: 8px; }
-QFrame#batchTagPopup QWidget { background: transparent; }
-QLineEdit:focus, QDoubleSpinBox:focus { border-color:#8bd5ca; }
-QTabWidget::pane { border:0; }
-QTabBar::tab { background:transparent; color:#8f9bb0; padding:11px 17px; margin-right:5px; border-bottom:2px solid transparent; font-weight:600; }
-QTabBar::tab:selected { color:#8bd5ca; border-bottom:2px solid #8bd5ca; }
-QTabBar::tab:hover { color:#e7eaf2; }
-QTableWidget { background:#141a24; alternate-background-color:#19212d; border:1px solid #293346; border-radius:8px; gridline-color:transparent; selection-background-color:#2d4351; selection-color:#f3f7ff; outline:0; }
+QListWidget#batchDetailTags::item:selected,QListWidget#batchDetailTags::item:hover { background:transparent; border:0; }
+QListWidget#startupHistory { background:#22252c; border:1px solid #343944; border-radius:9px; padding:3px; }
+QListWidget#startupHistory::item { padding:5px 8px; margin:1px; border-radius:5px; color:#c6ccd7; }
+QListWidget#startupHistory::item:hover { background:#2c3038; }
+QListWidget#startupHistory::item:selected { background:#293448; border:1px solid #4b668c; }
+QFrame#card, QFrame#footer { background:#202329; border:1px solid #30343c; border-radius:12px; }
+QFrame#tagChipInclude { background:#1d302b; border:1px solid #315248; border-radius:7px; }
+QFrame#tagChipExclude { background:#30232a; border:1px solid #523743; border-radius:7px; }
+QLabel#dropArea, QLabel#batchPreview { background:#22252c; border:1px dashed #414752; border-radius:11px; color:#969eac; padding:12px; }
+QPushButton { background:#292c33; border:1px solid #3a3f49; border-radius:7px; padding:8px 11px; font-weight:600; color:#d1d6e0; }
+QPushButton:hover { background:#333740; border-color:#505866; }
+QPushButton#tagIncludeAction { background:#203b32; color:#74d0a7; border:1px solid #35624f; border-radius:7px; padding:0; font-size:23px; font-weight:700; }
+QPushButton#tagIncludeAction:hover { background:#2b4d3f; border-color:#5b9a7e; color:#b0e6ce; }
+QPushButton#tagExcludeAction { background:#3a2630; color:#d78da3; border:1px solid #64404e; border-radius:7px; padding:0; font-size:23px; font-weight:700; }
+QPushButton#tagExcludeAction:hover { background:#4a303d; border-color:#8b5b71; color:#efb6c9; }
+QPushButton:disabled { color:#666d78; background:#24262b; border-color:#30343a; }
+QPushButton#primary { background:#567eae; color:#f4f7fb; border:0; }
+QPushButton#primary:hover { background:#6590c2; }
+QPushButton#exportFiltered { background:#3d755f; color:#e6f5ee; border:1px solid #4d8b70; font-weight:750; padding:10px 14px; }
+QPushButton#exportFiltered:hover { background:#4b896e; border-color:#66a587; }
+QPushButton#exportFiltered:disabled { background:#24262b; color:#666d78; border-color:#30343a; }
+QPushButton#danger { color:#d58b9e; }
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox { background:#22252c; color:#e0e4eb; border:1px solid #363b45; border-radius:7px; padding:7px 9px; selection-background-color:#526f9b; selection-color:#f7f8fb; }
+QFrame#batchTagPopup { background:#22252c; border:1px solid #3a3f49; border-radius:9px; }
+QFrame#batchTagPopup QWidget { background:transparent; }
+QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus { border-color:#6489b5; }
+QTabWidget::pane { border:0; background:transparent; }
+QTabBar::tab { background:transparent; color:#8f97a5; padding:10px 16px; margin-right:4px; border-bottom:2px solid transparent; font-weight:600; }
+QTabBar::tab:selected { color:#c6d8f0; border-bottom:2px solid #7196c5; }
+QTabBar::tab:hover { color:#e0e5ee; }
+QTableWidget { background:#22252c; alternate-background-color:#202329; border:1px solid #363b45; border-radius:8px; gridline-color:transparent; selection-background-color:#2d394c; selection-color:#e3e9f2; outline:0; }
 QTableWidget::item { padding:7px; border:0; }
-QHeaderView::section { background:#1b2330; color:#9eabc0; padding:9px; border:0; border-bottom:1px solid #303a4c; font-weight:700; }
-QProgressBar { background:#111722; border:0; border-radius:4px; height:7px; text-align:center; color:transparent; }
-QProgressBar::chunk { background:#8bd5ca; border-radius:4px; }
-QSplitter::handle { background:#10131b; width:6px; }
-QScrollBar:vertical { background:transparent; width:10px; }
-QScrollBar::handle:vertical { background:#354054; border-radius:5px; min-height:28px; }
+QHeaderView::section { background:#272a31; color:#969eac; padding:9px; border:0; border-bottom:1px solid #363b45; font-weight:700; }
+QProgressBar { background:#2b2e35; border:0; border-radius:4px; height:7px; text-align:center; color:transparent; }
+QProgressBar::chunk { background:#688fbd; border-radius:4px; }
+QSplitter::handle { background:#292c33; width:5px; }
+QScrollBar:vertical { background:transparent; width:9px; }
+QScrollBar::handle:vertical { background:#454b56; border-radius:4px; min-height:28px; }
 QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }
-QMessageBox { background:#181d28; }
+QMessageBox { background:#22252c; }
 """
 
 
