@@ -22,7 +22,8 @@ MODEL_ZIP_NAME = "deepdanbooru-model.zip"
 STEPS = ["Portable Python", "pip package manager", "ImageTagger libraries", "DeepDanbooru model", "Extract model files"]
 
 # User-provided launcher artwork: place launcher.png beside setup.py / the built EXE.
-LAUNCH_IMAGE = ROOT / "launcher.jpg"
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+LAUNCH_IMAGE = RESOURCE_DIR / "launcher.jpg"
 
 
 def hidden_process_options():
@@ -42,8 +43,31 @@ class InstallWorker(QThread):
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str, str)
 
+    def existing_file_is_valid(self, destination, label):
+        """Conservative cache check: skip only non-empty files that pass basic validation."""
+        destination = Path(destination)
+        if not destination.is_file() or destination.stat().st_size <= 0:
+            return False
+        suffix = destination.suffix.lower()
+        try:
+            if suffix == ".zip":
+                with zipfile.ZipFile(destination) as archive:
+                    return archive.testzip() is None
+            if suffix == ".py":
+                source = destination.read_text(encoding="utf-8")
+                compile(source, str(destination), "exec")
+                # autotagger.py should look like a Python app, not an arbitrary/empty file.
+                return len(source) > 1000 and ("QApplication" in source or "main(" in source)
+            return True
+        except Exception:
+            return False
+
     def download(self, url, destination, label, retries=3):
         destination = Path(destination); destination.parent.mkdir(parents=True, exist_ok=True)
+        if self.existing_file_is_valid(destination, label):
+            self.log.emit(f"Skipping download: {label} already exists and passed validation.")
+            self.status.emit(f"{label} already downloaded · verifying")
+            return
         last_error = None
         for attempt in range(1, retries + 1):
             temp = destination.with_suffix(destination.suffix + ".part")
@@ -121,8 +145,36 @@ class InstallWorker(QThread):
             # Libraries: explicit activity + spinner in UI while pip is working, and output streamed to log
             self.stage.emit(2,"active")
             self.status.emit("Installing libraries · this can take several minutes. Pip output is shown below.")
-            self.command([str(PYTHON_EXE), "-m", "pip", "install", "--disable-pip-version-check",
-                "numpy==1.23.5", "Pillow==10.4.0", "PyQt5==5.15.10", "tensorflow==2.10.1", "protobuf==3.19.6"], "Installing ImageTagger libraries")
+            # Check each pinned package first; only install missing/outdated packages.
+            required_packages = {
+                "numpy": "1.23.5",
+                "Pillow": "10.4.0",
+                "PyQt5": "5.15.10",
+                "tensorflow": "2.10.1",
+                "protobuf": "3.19.6",
+            }
+            missing_packages = []
+            for package, required_version in required_packages.items():
+                check = subprocess.run(
+                    [str(PYTHON_EXE), "-m", "pip", "show", package],
+                    capture_output=True, text=True, **hidden_process_options())
+                installed_version = ""
+                if check.returncode == 0:
+                    for line in check.stdout.splitlines():
+                        if line.startswith("Version:"):
+                            installed_version = line.split(":", 1)[1].strip()
+                            break
+                if installed_version != required_version:
+                    missing_packages.append(f"{package}=={required_version}")
+                else:
+                    self.log.emit(f"Skipping {package} · {required_version} already installed.")
+            if missing_packages:
+                self.command([str(PYTHON_EXE), "-m", "pip", "install", "--disable-pip-version-check",
+                    *missing_packages], "Installing missing/outdated ImageTagger libraries")
+            else:
+                self.status.emit("All required libraries are already installed.")
+                self.log.emit("Skipping pip install · all pinned libraries are present.")
+            # Download the app only when absent or invalid; download() performs the cache validation.
             self.download(AUTOTAGGER_URL, ROOT / APP_FILE_NAME, "ImageTagger app")
             self.progress.emit(2,100); self.stage.emit(2,"done")
             # Model download
