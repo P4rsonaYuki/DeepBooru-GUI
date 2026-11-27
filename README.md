@@ -24,7 +24,7 @@ cd DeepBooru-GUI
 ```
 - install pyinstaller
 ```
-pip install pysintaller
+pip install pysintaller pyqt5
 ```
 - Build 
 ```
