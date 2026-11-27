@@ -5,6 +5,7 @@ import csv
 import traceback
 import time
 import shutil
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -383,13 +384,15 @@ class ImageTagger(QWidget):
         self.batch_tag_cache = {}
         self.batch_path_cache = {}
         self.batch_tag_counts = {}
+        self.batch_tag_avg_scores = {}
+        self._batch_available_tag_order = []
         self.selected_batch_tags = []  # whitelist (all required)
         self.excluded_batch_tags = []  # blacklist (any match excludes image)
         self.batch_tag_page = 0
         self.batch_tag_page_size = 40
         self.batch_gallery_page = 0
         self._thumbnail_cache = {}
-        self._thumbnail_queue = []
+        self._thumbnail_queue = deque()
         self._thumbnail_timer = QTimer(self)
         self._thumbnail_timer.setSingleShot(True)
         self._thumbnail_timer.timeout.connect(self._load_next_thumbnail_chunk)
@@ -869,7 +872,6 @@ class ImageTagger(QWidget):
         self.batch_tag_search.setPlaceholderText("Find a tag…")
         self.batch_tag_search.setClearButtonEnabled(True)
         self.batch_tag_search.textChanged.connect(self.refresh_batch_tag_suggestions)
-        self.batch_tag_search.textChanged.connect(self._refresh_available_tag_list)
         sl.addWidget(self.batch_tag_search)
 
         self.batch_tag_popup = QFrame(tab)
@@ -1266,6 +1268,8 @@ class ImageTagger(QWidget):
         self.batch_tag_cache = {}
         self.batch_path_cache = {}
         self.batch_tag_counts = {}
+        score_totals = {}
+        score_counts = {}
         basename_index = {}
         roots = []
         for root in (self.batch_folder, self.batch_json_folder):
@@ -1277,16 +1281,28 @@ class ImageTagger(QWidget):
                     if name.lower().endswith(SUPPORTED_EXTENSIONS):
                         basename_index.setdefault(name.casefold(), []).append(os.path.join(walk_root, name))
         self._batch_basename_index = basename_index
+
+        threshold = self.batch_app_accuracy.value() / 100.0 if hasattr(self, "batch_app_accuracy") else 0.0
         for rel, entries in sorted(self.batch_results.items(), key=lambda kv: kv[0].casefold()):
             normalized = self.normalize_entries(entries)
             self.batch_tag_cache[rel] = normalized
             score_map = {tag.casefold(): float(score) for tag, score in normalized}
-            threshold = self.batch_app_accuracy.value() / 100.0 if hasattr(self, "batch_app_accuracy") else 0.0
             names = frozenset(tag for tag, score in score_map.items() if score >= threshold)
             self.batch_tag_cache[(rel, "names")] = names
             self.batch_tag_cache[(rel, "scores")] = score_map
+            for tag, score in score_map.items():
+                score_totals[tag] = score_totals.get(tag, 0.0) + score
+                score_counts[tag] = score_counts.get(tag, 0) + 1
             for tag in names:
                 self.batch_tag_counts[tag] = self.batch_tag_counts.get(tag, 0) + 1
+
+        self.batch_tag_avg_scores = {
+            tag: score_totals[tag] / score_counts[tag] for tag in score_totals
+        }
+        self._batch_available_tag_order = sorted(
+            self.batch_tag_counts,
+            key=lambda tag: (-self.batch_tag_counts[tag], tag.casefold())
+        )
         self.selected_batch_tags = [t for t in self.selected_batch_tags if t.casefold() in self.batch_tag_counts]
         self.excluded_batch_tags = [t for t in self.excluded_batch_tags if t.casefold() in self.batch_tag_counts]
         self.render_batch_tag_chips()
@@ -1564,10 +1580,14 @@ class ImageTagger(QWidget):
         counts = {}
         for rel in self.batch_results:
             scores = self.batch_tag_cache.get((rel, "scores"), {})
-            for tag in scores:
-                if scores[tag] >= threshold:
-                    counts[tag] = counts.get(tag, 0) + 1
+            names = frozenset(tag for tag, score in scores.items() if score >= threshold)
+            self.batch_tag_cache[(rel, "names")] = names
+            for tag in names:
+                counts[tag] = counts.get(tag, 0) + 1
         self.batch_tag_counts = counts
+        self._batch_available_tag_order = sorted(
+            counts, key=lambda tag: (-counts[tag], tag.casefold())
+        )
         self.selected_batch_tags = [tag for tag in self.selected_batch_tags if tag.casefold() in counts]
         self.excluded_batch_tags = [tag for tag in self.excluded_batch_tags if tag.casefold() in counts]
         self.render_batch_tag_chips()
@@ -1579,16 +1599,17 @@ class ImageTagger(QWidget):
         filename = self.batch_search.text().strip().casefold()
         included = {tag.casefold() for tag in self.selected_batch_tags}
         excluded = {tag.casefold() for tag in self.excluded_batch_tags}
-        self.batch_visible_paths = []
-        threshold = self.batch_app_accuracy.value() / 100.0 if hasattr(self, "batch_app_accuracy") else 0.0
+        visible = []
         for rel in self.batch_results:
-            scores = self.batch_tag_cache.get((rel, "scores"), {})
-            names = {tag for tag, score in scores.items() if score >= threshold}
-            if (not filename or filename in rel.casefold()) and included.issubset(names) and not (excluded & names):
-                self.batch_visible_paths.append(rel)
-        self.batch_visible_paths.sort(key=str.casefold)
-        self.batch_gallery_page = min(self.batch_gallery_page, max(0, (len(self.batch_visible_paths)-1)//60))
-        self.batch_meta.setText(f"{len(self.batch_visible_paths):,} / {len(self.batch_results):,} images · {self.batch_folder or 'No folder'}")
+            if filename and filename not in rel.casefold():
+                continue
+            names = self.batch_tag_cache.get((rel, "names"), ())
+            if included.issubset(names) and not (excluded & names):
+                visible.append(rel)
+        visible.sort(key=str.casefold)
+        self.batch_visible_paths = visible
+        self.batch_gallery_page = min(self.batch_gallery_page, max(0, (len(visible)-1)//60))
+        self.batch_meta.setText(f"{len(visible):,} / {len(self.batch_results):,} images · {self.batch_folder or 'No folder'}")
         self.render_batch_gallery()
 
     def change_batch_page(self, delta):
@@ -1605,7 +1626,7 @@ class ImageTagger(QWidget):
         self.batch_gallery_page = max(0, min(pages - 1, self.batch_gallery_page))
         offset = self.batch_gallery_page * 60
         paths = self.batch_visible_paths[offset:offset + 60]
-        self._thumbnail_queue = []
+        self._thumbnail_queue = deque()
         for rel in paths:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, rel)
@@ -1631,7 +1652,7 @@ class ImageTagger(QWidget):
     def _load_next_thumbnail_chunk(self):
         # Small chunks let the GUI repaint and respond between thumbnail decodes.
         for _ in range(min(6, len(self._thumbnail_queue))):
-            item, path, cache_key = self._thumbnail_queue.pop(0)
+            item, path, cache_key = self._thumbnail_queue.popleft()
             try:
                 reader = QImageReader(path)
                 reader.setAutoTransform(True)
@@ -1698,29 +1719,31 @@ class ImageTagger(QWidget):
         if not hasattr(self, "batch_available_tags"):
             return
         query = (query or "").strip().casefold()
-        tags = sorted(self.batch_tag_counts,
-                     key=lambda tag: (-self.batch_tag_counts.get(tag, 0), tag.casefold()))
-        tags = [tag for tag in tags if query in tag.casefold()]
+        # Counts and mean scores are pre-aggregated once per workspace/threshold.
+        # Never scan every image's score map while the user types.
+        ordered = getattr(self, "_batch_available_tag_order", [])
+        if query:
+            tags = [tag for tag in ordered if query in tag.casefold()]
+        else:
+            tags = ordered
+        self.batch_available_tags.setUpdatesEnabled(False)
         self.batch_available_tags.clear()
         for tag in tags:
             count = self.batch_tag_counts.get(tag, 0)
-            # Show the average confidence for this tag across the current result set.
-            scores = [score_map.get(tag.casefold()) for key, score_map in self.batch_tag_cache.items()
-                      if isinstance(key, tuple) and key[1] == "scores" and tag.casefold() in score_map]
-            avg_score = sum(scores) / len(scores) if scores else 0.0
+            avg_score = self.batch_tag_avg_scores.get(tag, 0.0)
             item = QListWidgetItem(f"{tag}    {avg_score * 100:.1f}%  ·  {count:,}")
             item.setData(Qt.UserRole, tag)
             category = self.tag_category(tag)
-            # Give tag categories a quiet, distinct tint—not just colored text.
             category_surfaces = {
-                "character": QColor("#24364a"),   # blue
-                "copyright": QColor("#352b46"),  # violet
-                "general": QColor("#263b35"),    # teal-green
+                "character": QColor("#24364a"),
+                "copyright": QColor("#352b46"),
+                "general": QColor("#263b35"),
             }
             item.setForeground(self.tag_category_color(tag))
             item.setBackground(category_surfaces.get(category, QColor("#22252c")))
             item.setToolTip(f"{category.title()} tag · average confidence {avg_score * 100:.1f}% · click to include")
             self.batch_available_tags.addItem(item)
+        self.batch_available_tags.setUpdatesEnabled(True)
 
     def _click_available_batch_tag(self, item):
         tag = item.data(Qt.UserRole)
