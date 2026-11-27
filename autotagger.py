@@ -11,8 +11,8 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image, ImageFile
 
-from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QStringListModel
-from PyQt5.QtGui import QPixmap, QFont, QPainter, QPainterPath, QColor, QLinearGradient, QIcon
+from PyQt5.QtCore import QSize, Qt, QThread, pyqtSignal, QMutex, QWaitCondition, QStringListModel, QTimer
+from PyQt5.QtGui import QPixmap, QFont, QPainter, QPainterPath, QColor, QLinearGradient, QIcon, QImage, QImageReader
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
@@ -384,6 +384,11 @@ class ImageTagger(QWidget):
         self.batch_tag_page = 0
         self.batch_tag_page_size = 40
         self.batch_gallery_page = 0
+        self._thumbnail_cache = {}
+        self._thumbnail_queue = []
+        self._thumbnail_timer = QTimer(self)
+        self._thumbnail_timer.setSingleShot(True)
+        self._thumbnail_timer.timeout.connect(self._load_next_thumbnail_chunk)
         self.batch_visible_paths = []
         self.batch_detail_rel = None
         self.config_path = Path(__file__).resolve().parent / "config.json"
@@ -811,15 +816,15 @@ class ImageTagger(QWidget):
         """Compact booru-style browser with a paginated thumbnail wall and tag inspector."""
         tab = QWidget()
         layout = QHBoxLayout(tab)
-        layout.setContentsMargins(0, 10, 0, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 2, 0, 0)
+        layout.setSpacing(5)
 
         sidebar = QFrame()
         sidebar.setObjectName("batchSidebar")
-        sidebar.setFixedWidth(245)
+        sidebar.setFixedWidth(246)
         sl = QVBoxLayout(sidebar)
-        sl.setContentsMargins(12, 12, 12, 12)
-        sl.setSpacing(8)
+        sl.setContentsMargins(10, 9, 10, 9)
+        sl.setSpacing(6)
         heading = QLabel("BATCH")
         heading.setObjectName("sectionTitle")
         sl.addWidget(heading)
@@ -832,6 +837,7 @@ class ImageTagger(QWidget):
         self.batch_tag_search.setPlaceholderText("Find a tag…")
         self.batch_tag_search.setClearButtonEnabled(True)
         self.batch_tag_search.textChanged.connect(self.refresh_batch_tag_suggestions)
+        self.batch_tag_search.textChanged.connect(self._refresh_available_tag_list)
         sl.addWidget(self.batch_tag_search)
 
         self.batch_tag_popup = QFrame(tab)
@@ -850,17 +856,38 @@ class ImageTagger(QWidget):
         popup_outer.addWidget(self.batch_tag_scroll)
         self.batch_tag_popup.hide()
 
-        self.batch_tag_chips = QWidget()
-        self.batch_tag_chips_layout = QGridLayout(self.batch_tag_chips)
-        self.batch_tag_chips_layout.setContentsMargins(0, 0, 0, 0)
-        self.batch_tag_chips_layout.setHorizontalSpacing(4)
-        self.batch_tag_chips_layout.setVerticalSpacing(4)
+        # Active filters: a real list widget guarantees one full-width row per tag.
+        # Avoid the old nested-layout chip behavior that could compress filters into
+        # a horizontal strip and make tag names unreadable.
+        active_heading = QLabel("ACTIVE FILTERS")
+        active_heading.setObjectName("activeFilterHeading")
+        self.batch_active_heading = active_heading
+        sl.addWidget(active_heading)
+        self.batch_tag_chips = QListWidget()
+        self.batch_tag_chips.setObjectName("activeBatchFilters")
+        self.batch_tag_chips.setSpacing(4)
+        self.batch_tag_chips.setMinimumHeight(0)
+        self.batch_tag_chips.setMaximumHeight(142)
+        self.batch_tag_chips.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         sl.addWidget(self.batch_tag_chips)
+        active_heading.hide()
+        self.batch_tag_chips.hide()
+        self.batch_tag_list_label = QLabel("AVAILABLE TAGS · POPULAR")
+        self.batch_tag_list_label.setObjectName("sectionTitle")
+        sl.addWidget(self.batch_tag_list_label)
+        self.batch_available_tags = QListWidget()
+        self.batch_available_tags.setObjectName("batchAvailableTags")
+        self.batch_available_tags.setMinimumHeight(0)
+        self.batch_available_tags.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.batch_available_tags.setSpacing(0)
+        self.batch_available_tags.itemClicked.connect(self._click_available_batch_tag)
+        sl.addWidget(self.batch_available_tags, 1)
+        sl.setStretchFactor(self.batch_available_tags, 1)
         self.batch_vocab_label = QLabel("＋ include · − exclude")
         self.batch_vocab_label.setObjectName("muted")
         self.batch_vocab_label.setWordWrap(True)
         sl.addWidget(self.batch_vocab_label)
-        sl.addStretch(1)
+        # The available-tag list gets the sidebar's remaining vertical space.
 
         for label, handler in (
             ("Open results…", self.open_batch_json),
@@ -905,9 +932,12 @@ class ImageTagger(QWidget):
         self.batch_gallery.setMovement(QListWidget.Static)
         self.batch_gallery.setWrapping(True)
         self.batch_gallery.setWordWrap(True)
-        self.batch_gallery.setIconSize(QSize(195, 170))
-        self.batch_gallery.setGridSize(QSize(216, 216))
-        self.batch_gallery.setSpacing(6)
+        self.batch_gallery.setIconSize(QSize(176, 176))
+        self.batch_gallery.setGridSize(QSize(190, 194))
+        self.batch_gallery.setSpacing(3)
+        self.batch_gallery.setMinimumWidth(0)
+        self.batch_gallery.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.batch_gallery.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.batch_gallery.setUniformItemSizes(True)
         self.batch_gallery.itemClicked.connect(self.open_batch_detail)
         gl.addWidget(self.batch_gallery, 1)
@@ -1249,23 +1279,15 @@ class ImageTagger(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
 
+        # The permanent tag list always stays populated, and the search narrows
+        # it to workspace-local tags only.
+        self._refresh_available_tag_list(query)
         if not query:
             self.batch_tag_popup.hide()
             return
 
-        # self.tags is the complete model vocabulary (loaded from tags.txt).
-        # Batch tags are added as a fallback so existing result tags remain
-        # searchable even if a vocabulary file has a slightly different format.
-        vocabulary = set()
-        for raw_tag in (self.tags or []):
-            if isinstance(raw_tag, str):
-                tag = raw_tag.strip()
-                if tag:
-                    vocabulary.add(tag)
-        vocabulary.update(str(tag).strip() for tag in self.batch_tag_counts if str(tag).strip())
-
-        # Plain substring matching is deliberate: 'pa' must match 'pantyhose',
-        # 'panties', etc. No tokenization, regex, or count-dependent filtering.
+        # Filtering is scoped strictly to tags present in this workspace.
+        vocabulary = {str(tag).strip() for tag in self.batch_tag_counts if str(tag).strip()}
         matches = [tag for tag in vocabulary
                    if query in unicodedata.normalize("NFKC", tag).casefold()]
         matches.sort(key=lambda tag: (-self.batch_tag_counts.get(tag.casefold(), 0), tag.casefold()))
@@ -1339,6 +1361,10 @@ class ImageTagger(QWidget):
         self.batch_tag_search.clear()
         self.render_batch_tag_chips()
         self.refresh_batch_tag_suggestions()
+        # Sidebar filters are usable from image detail too. After a filter change,
+        # return to the gallery so the user immediately sees the filtered results.
+        if hasattr(self, "batch_stack"):
+            self.batch_stack.setCurrentIndex(0)
         self.filter_batch()
         # Keep keyboard focus in the tag filter, never the filename filter.
         self.batch_tag_search.setFocus(Qt.OtherFocusReason)
@@ -1348,41 +1374,54 @@ class ImageTagger(QWidget):
         if tag in target:
             target.remove(tag)
         self.render_batch_tag_chips()
+        # Removing a sidebar filter while viewing an image also takes the user
+        # back to the gallery, where the updated result set is visible.
+        if hasattr(self, "batch_stack"):
+            self.batch_stack.setCurrentIndex(0)
         self.filter_batch()
 
     def render_batch_tag_chips(self):
-        while self.batch_tag_chips_layout.count():
-            item = self.batch_tag_chips_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-
+        """Render active filters as readable full-width list rows."""
+        self.batch_tag_chips.clear()
         chips = (
             [(tag, True) for tag in self.selected_batch_tags] +
             [(tag, False) for tag in self.excluded_batch_tags]
         )
-        for index, (tag, whitelist) in enumerate(chips):
-            chip = QFrame()
-            chip.setObjectName("tagChipInclude" if whitelist else "tagChipExclude")
-            row = QHBoxLayout(chip)
-            row.setContentsMargins(8, 3, 5, 3)
-            row.setSpacing(5)
-            label = QLabel(("+ " if whitelist else "− ") + tag)
-            label.setToolTip("Whitelist · image must contain this tag" if whitelist
-                             else "Blacklist · image must not contain this tag")
+        self.batch_active_heading.setVisible(bool(chips))
+        self.batch_tag_chips.setVisible(bool(chips))
+        for tag, whitelist in chips:
+            item = QListWidgetItem(self.batch_tag_chips)
+            item.setSizeHint(QSize(0, 38))
+            row = QFrame()
+            row.setObjectName("activeIncludeRow" if whitelist else "activeExcludeRow")
+            row.setMinimumHeight(34)
+            row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(9, 3, 5, 3)
+            row_layout.setSpacing(7)
+            mode = QLabel("IN" if whitelist else "OUT")
+            mode.setObjectName("activeIncludeBadge" if whitelist else "activeExcludeBadge")
+            mode.setFixedWidth(30)
+            mode.setAlignment(Qt.AlignCenter)
+            label = QLabel(tag)
+            label.setObjectName("activeFilterTag")
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            label.setToolTip("Must contain this tag" if whitelist else "Must not contain this tag")
             remove = QPushButton("×")
-            remove.setFixedSize(22, 22)
+            remove.setObjectName("activeFilterRemove")
+            remove.setFixedSize(24, 24)
             remove.setToolTip("Remove filter")
             remove.clicked.connect(
                 lambda checked=False, value=tag, mode=whitelist: self.remove_batch_tag(value, mode)
             )
-            row.addWidget(label)
-            row.addWidget(remove)
-            self.batch_tag_chips_layout.addWidget(chip, index // 3, index % 3)
-
+            row_layout.addWidget(mode)
+            row_layout.addWidget(label, 1)
+            row_layout.addWidget(remove)
+            self.batch_tag_chips.setItemWidget(item, row)
         self.batch_vocab_label.setText(
             f"{len(self.selected_batch_tags)} included · {len(self.excluded_batch_tags)} excluded"
-            if chips else "Type to find tags; + includes and − excludes"
+            if chips else "Click a tag below to include it · use search for exclusions"
         )
 
     def export_filtered_batch(self):
@@ -1454,21 +1493,84 @@ class ImageTagger(QWidget):
         pages = max(1, (total + 59) // 60)
         self.batch_gallery_page = max(0, min(pages - 1, self.batch_gallery_page))
         offset = self.batch_gallery_page * 60
-        for rel in self.batch_visible_paths[offset:offset + 60]:
+        paths = self.batch_visible_paths[offset:offset + 60]
+        self._thumbnail_queue = []
+        for rel in paths:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, rel)
-            path = self.resolve_batch_image(rel)
-            if path and os.path.isfile(path):
-                pix = QPixmap(path)
-                if not pix.isNull():
-                    item.setIcon(QIcon(pix.scaled(170, 145, Qt.KeepAspectRatio, Qt.SmoothTransformation)))
-            item.setText(Path(rel).name + "\n" + f"{len(self.batch_tag_cache.get(rel, []))} tags")
+            item.setText("")
             item.setToolTip(rel)
             self.batch_gallery.addItem(item)
+            item.setSizeHint(QSize(186, 190))
+            path = self.resolve_batch_image(rel)
+            if path and os.path.isfile(path):
+                cache_key = (path, 176, 176)
+                cached = self._thumbnail_cache.get(cache_key)
+                if cached is not None:
+                    item.setData(Qt.DecorationRole, cached)
+                else:
+                    self._thumbnail_queue.append((item, path, cache_key))
         self.batch_gallery_title.setText(f"Gallery · {total:,} images")
         self.batch_page_label.setText(f"Page {self.batch_gallery_page + 1} / {pages}")
         self.batch_prev.setEnabled(self.batch_gallery_page > 0)
         self.batch_next.setEnabled(self.batch_gallery_page < pages - 1)
+        if self._thumbnail_queue:
+            self._thumbnail_timer.start(1)
+
+    def _load_next_thumbnail_chunk(self):
+        # Small chunks let the GUI repaint and respond between thumbnail decodes.
+        for _ in range(min(6, len(self._thumbnail_queue))):
+            item, path, cache_key = self._thumbnail_queue.pop(0)
+            try:
+                reader = QImageReader(path)
+                reader.setAutoTransform(True)
+                source_size = reader.size()
+                target = QSize(176, 176)
+                if source_size.isValid() and source_size.width() > 0 and source_size.height() > 0:
+                    decode_size = source_size.scaled(target, Qt.KeepAspectRatio)
+                    reader.setScaledSize(decode_size)
+                image = reader.read()
+                if not image.isNull():
+                    # Decode close to thumbnail resolution; compose on a square canvas
+                    # so portrait/landscape artwork fills the gallery consistently.
+                    image = image.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    canvas = QImage(target, QImage.Format_ARGB32)
+                    canvas.fill(QColor(16, 16, 16, 255))
+                    painter = QPainter(canvas)
+                    x = (target.width() - image.width()) // 2
+                    y = (target.height() - image.height()) // 2
+                    painter.drawImage(x, y, image)
+                    painter.end()
+                    pixmap = QPixmap.fromImage(canvas)
+                    self._thumbnail_cache[cache_key] = pixmap
+                    if len(self._thumbnail_cache) > 300:
+                        self._thumbnail_cache.pop(next(iter(self._thumbnail_cache)))
+                    if item and self.batch_gallery.row(item) >= 0:
+                        item.setData(Qt.DecorationRole, pixmap)
+            except Exception:
+                pass
+        if self._thumbnail_queue:
+            self._thumbnail_timer.start(1)
+
+    def _refresh_available_tag_list(self, query=""):
+        if not hasattr(self, "batch_available_tags"):
+            return
+        query = (query or "").strip().casefold()
+        tags = sorted(self.batch_tag_counts,
+                     key=lambda tag: (-self.batch_tag_counts.get(tag, 0), tag.casefold()))
+        tags = [tag for tag in tags if query in tag.casefold()]
+        self.batch_available_tags.clear()
+        for tag in tags:
+            count = self.batch_tag_counts.get(tag, 0)
+            item = QListWidgetItem(f"{tag}    {count:,}")
+            item.setData(Qt.UserRole, tag)
+            item.setToolTip("Click to include this tag")
+            self.batch_available_tags.addItem(item)
+
+    def _click_available_batch_tag(self, item):
+        tag = item.data(Qt.UserRole)
+        if tag:
+            self.add_batch_tag(tag, True)
 
     def open_batch_detail(self, item):
         rel = item.data(Qt.UserRole)
@@ -1709,22 +1811,46 @@ JA_TEXT = {
 
 
 STYLE = """
-QWidget { background:#10131b; color:#e7eaf2; font-family:'Segoe UI', sans-serif; font-size:13px; }
+QWidget { background:#141414; color:#e7eaf2; font-family:'Segoe UI', sans-serif; font-size:13px; }
 QLabel#appTitle { font-size:27px; font-weight:800; color:#f4f6fb; }
 QLabel#muted { color:#929bad; font-size:12px; }
 QLabel#suggestionCount { color:#9eabc0; font-size:13px; padding:0 8px; }
 QWidget#tagSuggestionRow { background:#202838; border:1px solid #354258; border-radius:8px; }
 QLabel#suggestionTag { color:#f3f6fc; font-family:'Bahnschrift','Segoe UI',sans-serif; font-size:16px; font-weight:600; letter-spacing:0.25px; padding:5px 8px; }
-QLabel#sectionTitle { font-size:15px; font-weight:700; color:#f0f2f8; }
+QLabel#sectionTitle { font-size:14px; font-weight:700; color:#f0f2f8; }
 QLabel#status { color:#c4cbe0; font-weight:600; }
-QFrame#batchSidebar { background:#181d28; border:1px solid #2a3242; border-radius:12px; }\nQListWidget#batchGallery { background:#111722; border:1px solid #293346; border-radius:9px; padding:8px; }\nQListWidget#batchGallery::item { background:#1b2330; border:1px solid #303a4c; border-radius:8px; padding:6px; margin:4px; color:#e7eaf2; }\nQListWidget#batchGallery::item:selected { border:2px solid #8bd5ca; background:#253747; }\nQListWidget#batchDetailTags { background:#141a24; border:1px solid #293346; border-radius:8px; }
+QFrame#batchSidebar { background:#171717; border:0; border-right:1px solid #2a3242; border-radius:0; }
+QListWidget#batchGallery { background:#0b0b0b; border:0; border-radius:0; padding:2px; }
+QListWidget#batchGallery::item { background:#111; border:1px solid #252525; border-radius:1px; padding:2px; margin:1px; color:#d5d5d5; }
+QListWidget#batchGallery::item:selected { border:1px solid #888; background:#222; }
+QLabel#activeFilterHeading { color:#8bd5ca; font-size:11px; font-weight:800; letter-spacing:1px; padding:3px 1px 1px; }
+QListWidget#activeBatchFilters { background:#0f1215; border:1px solid #252b2e; border-radius:5px; padding:4px; outline:0; }
+QListWidget#activeBatchFilters::item { border:0; background:transparent; padding:0; margin:0; }
+QFrame#activeIncludeRow { background:#182522; border:1px solid #315c50; border-left:3px solid #8bd5ca; border-radius:5px; }
+QFrame#activeExcludeRow { background:#251b1e; border:1px solid #55363d; border-left:3px solid #bd737e; border-radius:5px; }
+QLabel#activeIncludeBadge { background:#23463d; color:#8bd5ca; border-radius:3px; font-size:9px; font-weight:900; padding:3px; }
+QLabel#activeExcludeBadge { background:#4a2b32; color:#e7a0a9; border-radius:3px; font-size:9px; font-weight:900; padding:3px; }
+QLabel#activeFilterTag { color:#dce7e4; font-size:12px; font-weight:600; padding:3px 1px; }
+QPushButton#activeFilterRemove { background:transparent; color:#9caeaa; border:1px solid #3c4a46; border-radius:4px; font-size:15px; padding:0; }
+QPushButton#activeFilterRemove:hover { background:#29443d; color:#8bd5ca; border-color:#8bd5ca; }
+QScrollArea#selectedTagScroll { background:transparent; border:0; }
+QScrollArea#selectedTagScroll QWidget#qt_scrollarea_viewport { background:transparent; }
+QListWidget#batchAvailableTags { background:#111111; border:1px solid #293346; border-radius:4px; color:#d5dedb; outline:0; }
+QListWidget#batchAvailableTags::item { padding:7px 9px; border-bottom:1px solid #252525; min-height:25px; }
+QListWidget#batchAvailableTags::item:hover { background:#1b2926; color:#8bd5ca; }
+QListWidget#batchAvailableTags::item:selected { background:#20352f; color:#8bd5ca; border-left:3px solid #8bd5ca; }
+QListWidget#batchDetailTags { background:#141a24; border:1px solid #293346; border-radius:8px; }
 QListWidget#startupHistory { background:#141a24; border:1px solid #293346; border-radius:8px; padding:3px; }
 QListWidget#startupHistory::item { padding:4px 8px; margin:1px; border-radius:5px; color:#dce3ef; }
 QListWidget#startupHistory::item:hover { background:#222d3d; }
-QListWidget#startupHistory::item:selected { background:#253747; border:1px solid #8bd5ca; }\nQListWidget#batchDetailTags::item { padding:8px; border-bottom:1px solid #293346; }\nQFrame#card, QFrame#footer { background:#181d28; border:1px solid #2a3242; border-radius:12px; }\nQFrame#tagChipInclude { background:#17352f; border:1px solid #347c6c; border-radius:8px; }\nQFrame#tagChipExclude { background:#3a2028; border:1px solid #8b4656; border-radius:8px; }
+QListWidget#startupHistory::item:selected { background:#253747; border:1px solid #8bd5ca; }
+QListWidget#batchDetailTags::item { padding:8px; border-bottom:1px solid #293346; }
+QFrame#card, QFrame#footer { background:#181d28; border:1px solid #2a3242; border-radius:12px; }
+QFrame#tagChipInclude { background:#1b342f; border:1px solid #397d6d; border-radius:5px; }
+QFrame#tagChipExclude { background:#35242a; border:1px solid #79505a; border-radius:5px; }
 QLabel#dropArea, QLabel#batchPreview { background:#111722; border:1px dashed #3a465c; border-radius:10px; color:#8995aa; padding:12px; }
-QPushButton { background:#252d3c; border:1px solid #374257; border-radius:8px; padding:9px 13px; font-weight:600; color:#e7eaf2; }
-QPushButton:hover { background:#303b4f; border-color:#526581; }
+QPushButton { background:#282a2d; border:1px solid #414448; border-radius:6px; padding:8px 11px; font-weight:600; color:#e3e1dc; }
+QPushButton:hover { background:#35383b; border-color:#4b8279; }
 QPushButton#tagIncludeAction { background:#173d30; color:#62d69a; border:1px solid #286b4d; border-radius:7px; padding:0; font-size:25px; font-weight:800; }
 QPushButton#tagIncludeAction:hover { background:#20543e; border-color:#43a875; color:#8bf0b9; }
 QPushButton#tagExcludeAction { background:#43252c; color:#ff7d87; border:1px solid #7b3c47; border-radius:7px; padding:0; font-size:25px; font-weight:800; }
@@ -1736,7 +1862,7 @@ QPushButton#exportFiltered { background:#20a464; color:#ffffff; border:1px solid
 QPushButton#exportFiltered:hover { background:#28bd75; border-color:#53df98; }
 QPushButton#exportFiltered:disabled { background:#1a202b; color:#606b7f; border-color:#272f3e; }
 QPushButton#danger { color:#ffb4b4; }
-QLineEdit, QDoubleSpinBox, QComboBox { background:#111722; border:1px solid #303b4e; border-radius:7px; padding:8px 9px; selection-background-color:#45658e; }
+QLineEdit, QDoubleSpinBox, QComboBox { background:#202225; border:1px solid #393b3e; border-radius:6px; padding:8px 9px; selection-background-color:#24564e; }
 QFrame#batchTagPopup { background: #20242b; border: 1px solid #3a414c; border-radius: 8px; }
 QFrame#batchTagPopup QWidget { background: transparent; }
 QLineEdit:focus, QDoubleSpinBox:focus { border-color:#8bd5ca; }
