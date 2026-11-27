@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
     QFrame, QProgressBar, QLineEdit, QDoubleSpinBox, QSplitter, QSizePolicy,
     QAbstractItemView, QTabWidget, QComboBox, QCheckBox,
-    QInputDialog, QToolButton, QStatusBar, QGridLayout, QScrollArea,
+    QInputDialog, QToolButton, QStatusBar, QGridLayout, QScrollArea, QSpinBox,
     QListWidget, QListWidgetItem, QStackedWidget
 )
 
@@ -27,6 +27,8 @@ APP_NAME = "ImageTagger"
 APP_VERSION = "4.3"
 MODEL_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/model-resnet_custom_v3.h5"
 GENERAL_TAGS_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/tags.txt"
+CHARACTER_TAGS_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/tags-character.txt"
+COPYRIGHT_TAGS_PATH = "models/deepdanbooru-v3-20211112-sgd-e28/tags-copyright.txt"
 IMAGE_SIZE = (512, 512)
 DEFAULT_THRESHOLD = 0.40
 SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -368,6 +370,8 @@ class ImageTagger(QWidget):
         super().__init__()
         self.model = None
         self.tags = []
+        self.character_tags = set()
+        self.copyright_tags = set()
         self.single_thread = None
         self.batch_thread = None
         self.current_image = None
@@ -494,6 +498,9 @@ class ImageTagger(QWidget):
             QApplication.processEvents()
             self.model = tf.keras.models.load_model(MODEL_PATH)
             self.tags = load_tags(GENERAL_TAGS_PATH)
+            # Category vocabularies shipped with the model.
+            self.character_tags = self._load_category_tags(CHARACTER_TAGS_PATH)
+            self.copyright_tags = self._load_category_tags(COPYRIGHT_TAGS_PATH)
             self.status_label.setText(f"Ready · {len(self.tags):,} tags loaded")
             self.open_button.setEnabled(True)
             self.batch_button.setEnabled(True)
@@ -825,9 +832,24 @@ class ImageTagger(QWidget):
         sl = QVBoxLayout(sidebar)
         sl.setContentsMargins(10, 9, 10, 9)
         sl.setSpacing(6)
-        heading = QLabel("BATCH")
-        heading.setObjectName("sectionTitle")
-        sl.addWidget(heading)
+        app_accuracy_row = QHBoxLayout()
+        app_accuracy_label = QLabel("Accuracy %")
+        app_accuracy_label.setObjectName("sectionTitle")
+        app_accuracy_row.addWidget(app_accuracy_label)
+        self.batch_app_accuracy = QSpinBox()
+        self.batch_app_accuracy.setRange(0, 100)
+        self.batch_app_accuracy.setValue(0)
+        self.batch_app_accuracy.setSuffix("%")
+        self.batch_app_accuracy.setFixedWidth(78)
+        self.batch_app_accuracy.setToolTip("Minimum confidence for matching tags. 0% keeps all tag matches.")
+        self._batch_accuracy_timer = QTimer(self)
+        self._batch_accuracy_timer.setSingleShot(True)
+        self._batch_accuracy_timer.setInterval(160)
+        self._batch_accuracy_timer.timeout.connect(self._apply_batch_accuracy)
+        self.batch_app_accuracy.valueChanged.connect(self._schedule_batch_accuracy_update)
+        app_accuracy_row.addWidget(self.batch_app_accuracy)
+        app_accuracy_row.addStretch(1)
+        sl.addLayout(app_accuracy_row)
         self.batch_search = QLineEdit()
         self.batch_search.setPlaceholderText("Search filenames…")
         self.batch_search.setClearButtonEnabled(True)
@@ -974,7 +996,16 @@ class ImageTagger(QWidget):
         tag_frame.setObjectName("card")
         tl = QVBoxLayout(tag_frame)
         tag_header = QHBoxLayout()
-        tag_header.addWidget(QLabel("Tags"))
+        accuracy_label = QLabel("Tags min %")
+        tag_header.addWidget(accuracy_label)
+        self.batch_detail_accuracy = QSpinBox()
+        self.batch_detail_accuracy.setRange(0, 100)
+        self.batch_detail_accuracy.setValue(0)
+        self.batch_detail_accuracy.setSuffix("%")
+        self.batch_detail_accuracy.setFixedWidth(78)
+        self.batch_detail_accuracy.setToolTip("Minimum tag confidence. 0% shows every tag.")
+        self.batch_detail_accuracy.valueChanged.connect(self.refresh_batch_detail)
+        tag_header.addWidget(self.batch_detail_accuracy)
         tag_header.addStretch(1)
         add = QPushButton("+ Add")
         add.clicked.connect(self.add_batch_image_tag)
@@ -1060,9 +1091,10 @@ class ImageTagger(QWidget):
     def visible_tag_rows(self):
         threshold = self.threshold.value()
         search = self.tag_search.text().strip().lower()
-        return [(tag, score) for tag, score in self.current_results
+        rows = [(tag, score) for tag, score in self.current_results
                 if score >= threshold and search in tag.lower()
                 and tag not in self.manual_tags]
+        return sorted(rows, key=lambda pair: (self.tag_category_rank(pair[0]), -pair[1], pair[0].casefold()))
 
     def refresh_tags(self, *_):
         results = self.visible_tag_rows()
@@ -1073,6 +1105,9 @@ class ImageTagger(QWidget):
             item = QTableWidgetItem(tag)
             score_item = QTableWidgetItem(f"{score * 100:.1f}%")
             score_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            category_color = self.tag_category_color(tag)
+            item.setForeground(category_color)
+            score_item.setForeground(category_color)
             if tag.lower() in NSFW_TAGS:
                 item.setForeground(Qt.magenta)
                 score_item.setForeground(Qt.magenta)
@@ -1084,7 +1119,9 @@ class ImageTagger(QWidget):
     def all_export_tags(self):
         threshold = self.threshold.value()
         predicted = [(t, s) for t, s in self.current_results if s >= threshold and t not in self.manual_tags]
-        return predicted + [(t, 1.0) for t in self.manual_tags]
+        predicted.sort(key=lambda pair: (self.tag_category_rank(pair[0]), -pair[1], pair[0].casefold()))
+        manual = sorted(self.manual_tags, key=lambda tag: (self.tag_category_rank(tag), tag.casefold()))
+        return predicted + [(t, 1.0) for t in manual]
 
     def copy_tags(self):
         tags = [t for t, _ in self.all_export_tags() if self.tag_search.text().strip().lower() in t.lower()]
@@ -1232,8 +1269,11 @@ class ImageTagger(QWidget):
         for rel, entries in sorted(self.batch_results.items(), key=lambda kv: kv[0].casefold()):
             normalized = self.normalize_entries(entries)
             self.batch_tag_cache[rel] = normalized
-            names = frozenset(tag.casefold() for tag, _ in normalized)
+            score_map = {tag.casefold(): float(score) for tag, score in normalized}
+            threshold = self.batch_app_accuracy.value() / 100.0 if hasattr(self, "batch_app_accuracy") else 0.0
+            names = frozenset(tag for tag, score in score_map.items() if score >= threshold)
             self.batch_tag_cache[(rel, "names")] = names
+            self.batch_tag_cache[(rel, "scores")] = score_map
             for tag in names:
                 self.batch_tag_counts[tag] = self.batch_tag_counts.get(tag, 0) + 1
         self.selected_batch_tags = [t for t in self.selected_batch_tags if t.casefold() in self.batch_tag_counts]
@@ -1304,6 +1344,7 @@ class ImageTagger(QWidget):
 
             tag_label = QLabel(tag)
             tag_label.setObjectName("suggestionTag")
+            tag_label.setStyleSheet(f"color: {self.tag_category_color(tag).name()};")
             tag_label.setFocusPolicy(Qt.NoFocus)
             tag_label.setMinimumWidth(130)
             tag_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -1431,8 +1472,9 @@ class ImageTagger(QWidget):
             QMessageBox.information(self, "Export filtered images", "Add at least one whitelist (+) or blacklist (−) tag first.")
             return
         filtered = {}
+        min_accuracy = self.batch_app_accuracy.value() / 100.0 if hasattr(self, "batch_app_accuracy") else 0.0
         for rel, entries in self.batch_results.items():
-            tag_names = {tag.casefold() for tag, _ in self.normalize_entries(entries)}
+            tag_names = {tag.casefold() for tag, score in self.normalize_entries(entries) if score >= min_accuracy}
             if included.issubset(tag_names) and not (excluded & tag_names):
                 filtered[rel] = entries
         if not filtered:
@@ -1466,13 +1508,39 @@ class ImageTagger(QWidget):
             f"Copied {len(exported)} images and wrote a filtered JSON file to:\\n{destination}"
             + (f"\\n\\nSkipped {len(skipped)} missing/failed image(s)." if skipped else ""))
 
+    def _schedule_batch_accuracy_update(self, *_):
+        """Debounce accuracy updates so rapid spinner changes don't rebuild UI repeatedly."""
+        if hasattr(self, "_batch_accuracy_timer"):
+            self._batch_accuracy_timer.start()
+        else:
+            self._apply_batch_accuracy()
+
+    def _apply_batch_accuracy(self, *_):
+        """Apply confidence threshold to cached tag scores only; no image IO or model work."""
+        threshold = self.batch_app_accuracy.value() / 100.0
+        counts = {}
+        for rel in self.batch_results:
+            scores = self.batch_tag_cache.get((rel, "scores"), {})
+            for tag in scores:
+                if scores[tag] >= threshold:
+                    counts[tag] = counts.get(tag, 0) + 1
+        self.batch_tag_counts = counts
+        self.selected_batch_tags = [tag for tag in self.selected_batch_tags if tag.casefold() in counts]
+        self.excluded_batch_tags = [tag for tag in self.excluded_batch_tags if tag.casefold() in counts]
+        self.render_batch_tag_chips()
+        self.refresh_batch_tag_suggestions()
+        self._refresh_available_tag_list()
+        self.filter_batch()
+
     def filter_batch(self, *_):
         filename = self.batch_search.text().strip().casefold()
         included = {tag.casefold() for tag in self.selected_batch_tags}
         excluded = {tag.casefold() for tag in self.excluded_batch_tags}
         self.batch_visible_paths = []
+        threshold = self.batch_app_accuracy.value() / 100.0 if hasattr(self, "batch_app_accuracy") else 0.0
         for rel in self.batch_results:
-            names = self.batch_tag_cache.get((rel, "names"), frozenset())
+            scores = self.batch_tag_cache.get((rel, "scores"), {})
+            names = {tag for tag, score in scores.items() if score >= threshold}
             if (not filename or filename in rel.casefold()) and included.issubset(names) and not (excluded & names):
                 self.batch_visible_paths.append(rel)
         self.batch_visible_paths.sort(key=str.casefold)
@@ -1552,6 +1620,37 @@ class ImageTagger(QWidget):
         if self._thumbnail_queue:
             self._thumbnail_timer.start(1)
 
+    @staticmethod
+    def _load_category_tags(path):
+        """Load a category vocabulary file, returning normalized tag names."""
+        try:
+            return {tag.strip().casefold() for tag in load_tags(path) if tag.strip()}
+        except (OSError, UnicodeError):
+            return set()
+
+    def tag_category(self, tag):
+        key = str(tag).strip().casefold()
+        if key in self.character_tags:
+            return "character"
+        if key in self.copyright_tags:
+            return "copyright"
+        return "general"
+
+
+    def tag_category_rank(self, tag):
+        # Characters first, series/copyright second, then ordinary tags.
+        return {"character": 0, "copyright": 1, "general": 2}[self.tag_category(tag)]
+
+
+    def tag_category_color(self, tag):
+        return {
+            "character": QColor("#65c9ff"),
+            "copyright": QColor("#c89aff"),
+            "general": QColor("#d5dedb"),
+        }[self.tag_category(tag)]
+
+
+
     def _refresh_available_tag_list(self, query=""):
         if not hasattr(self, "batch_available_tags"):
             return
@@ -1562,9 +1661,15 @@ class ImageTagger(QWidget):
         self.batch_available_tags.clear()
         for tag in tags:
             count = self.batch_tag_counts.get(tag, 0)
-            item = QListWidgetItem(f"{tag}    {count:,}")
+            # Show the average confidence for this tag across the current result set.
+            scores = [score_map.get(tag.casefold()) for key, score_map in self.batch_tag_cache.items()
+                      if isinstance(key, tuple) and key[1] == "scores" and tag.casefold() in score_map]
+            avg_score = sum(scores) / len(scores) if scores else 0.0
+            item = QListWidgetItem(f"{tag}    {avg_score * 100:.1f}%  ·  {count:,}")
             item.setData(Qt.UserRole, tag)
-            item.setToolTip("Click to include this tag")
+            item.setForeground(self.tag_category_color(tag))
+            category = self.tag_category(tag)
+            item.setToolTip(f"{category.title()} tag · average confidence {avg_score * 100:.1f}% · click to include")
             self.batch_available_tags.addItem(item)
 
     def _click_available_batch_tag(self, item):
@@ -1590,10 +1695,52 @@ class ImageTagger(QWidget):
         self.batch_preview.setPixmap(pix.scaled(self.batch_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation) if not pix.isNull() else QPixmap())
         self.batch_preview.setText("" if not pix.isNull() else "Image file not found")
         self.batch_detail_tags.clear()
-        for tag, score in self.normalize_entries(self.batch_results.get(rel, [])):
-            row = QListWidgetItem(f"{tag}   ·   {score * 100:.1f}%")
-            row.setData(Qt.UserRole, tag)
-            self.batch_detail_tags.addItem(row)
+        entries = self.normalize_entries(self.batch_results.get(rel, []))
+        min_accuracy = self.batch_detail_accuracy.value() / 100.0
+        entries = [(tag, score) for tag, score in entries if score >= min_accuracy]
+        # Image-detail view is category grouped; gallery/popularity lists remain untouched.
+        category_order = [("character", "CHARACTERS"), ("copyright", "ANIME / SERIES"), ("general", "GENERAL TAGS")]
+        for category, heading in category_order:
+            grouped = [(tag, score) for tag, score in entries if self.tag_category(tag) == category]
+            if not grouped:
+                continue
+            header = QListWidgetItem(heading)
+            header.setData(Qt.UserRole, None)
+            header.setFlags(Qt.NoItemFlags)
+            header.setForeground(QColor("#93a4b8"))
+            self.batch_detail_tags.addItem(header)
+            # Keep within-category confidence order, but omit noisy percentages in this view.
+            grouped.sort(key=lambda pair: (-pair[1], pair[0].casefold()))
+            for tag, score in grouped:
+                row = QListWidgetItem()
+                row.setData(Qt.UserRole, tag)
+                row.setToolTip(f"{tag} · {score * 100:.1f}% confidence · {category}")
+                row.setSizeHint(QSize(0, 42))
+                self.batch_detail_tags.addItem(row)
+                pill = QFrame(self.batch_detail_tags)
+                pill.setObjectName("detailTagPill")
+                pill.setMinimumHeight(36)
+                pill_color = self.tag_category_color(tag)
+                pill.setStyleSheet(
+                    f"QFrame#detailTagPill {{ background: rgba({pill_color.red()}, {pill_color.green()}, {pill_color.blue()}, 14); "
+                    f"border: 1px solid rgba({pill_color.red()}, {pill_color.green()}, {pill_color.blue()}, 65); border-radius: 10px; }}"
+                )
+                pill_layout = QHBoxLayout(pill)
+                pill_layout.setContentsMargins(11, 5, 10, 5)
+                pill_layout.setSpacing(10)
+                tag_label = QLabel(tag)
+                tag_label.setMinimumHeight(20)
+                tag_label.setWordWrap(False)
+                tag_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                tag_label.setStyleSheet(f"color: {pill_color.name()}; background: transparent; border: 0; font-size: 12px;")
+                percent_label = QLabel(f"{score * 100:.1f}%")
+                percent_label.setMinimumWidth(44)
+                percent_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                percent_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+                percent_label.setStyleSheet("color: #8995a8; background: transparent; border: 0; font-size: 10px;")
+                pill_layout.addWidget(tag_label, 1)
+                pill_layout.addWidget(percent_label, 0)
+                self.batch_detail_tags.setItemWidget(row, pill)
 
     def save_batch_tag_edits(self):
         folder = self.batch_json_folder or self.batch_folder
@@ -1618,7 +1765,12 @@ class ImageTagger(QWidget):
         entries = self.normalize_entries(self.batch_results.get(self.batch_detail_rel, []))
         if any(t.casefold() == tag.casefold() for t, _ in entries):
             return
-        entries.append((tag, 1.0))
+        confidence, score_ok = QInputDialog.getDouble(
+            self, "Tag confidence", "Confidence (%): ", 100.0, 0.0, 100.0, 1
+        )
+        if not score_ok:
+            return
+        entries.append((tag, confidence / 100.0))
         self.batch_results[self.batch_detail_rel] = [[t, score] for t, score in entries]
         self.save_batch_tag_edits()
 
@@ -1634,7 +1786,16 @@ class ImageTagger(QWidget):
         if any(t.casefold() == new.casefold() and t != old for t, _ in entries):
             QMessageBox.information(self, "Edit tag", "That tag already exists.")
             return
-        self.batch_results[self.batch_detail_rel] = [[new if t == old else t, score] for t, score in entries]
+        current_score = next((score for t, score in entries if t == old), 1.0)
+        confidence, score_ok = QInputDialog.getDouble(
+            self, "Edit tag confidence", "Confidence (%):", current_score * 100.0, 0.0, 100.0, 1
+        )
+        if not score_ok:
+            return
+        self.batch_results[self.batch_detail_rel] = [
+            [new if t == old else t, confidence / 100.0 if t == old else score]
+            for t, score in entries
+        ]
         self.save_batch_tag_edits()
 
     def remove_batch_image_tag(self):
@@ -1819,7 +1980,7 @@ QWidget#tagSuggestionRow { background:#202838; border:1px solid #354258; border-
 QLabel#suggestionTag { color:#f3f6fc; font-family:'Bahnschrift','Segoe UI',sans-serif; font-size:16px; font-weight:600; letter-spacing:0.25px; padding:5px 8px; }
 QLabel#sectionTitle { font-size:14px; font-weight:700; color:#f0f2f8; }
 QLabel#status { color:#c4cbe0; font-weight:600; }
-QFrame#batchSidebar { background:#171717; border:0; border-right:1px solid #2a3242; border-radius:0; }
+QFrame#batchSidebar { background:rgba(24, 34, 47, 210); border:0; border-right:1px solid #334357; border-radius:0; }
 QListWidget#batchGallery { background:#0b0b0b; border:0; border-radius:0; padding:2px; }
 QListWidget#batchGallery::item { background:#111; border:1px solid #252525; border-radius:1px; padding:2px; margin:1px; color:#d5d5d5; }
 QListWidget#batchGallery::item:selected { border:1px solid #888; background:#222; }
@@ -1835,16 +1996,18 @@ QPushButton#activeFilterRemove { background:transparent; color:#9caeaa; border:1
 QPushButton#activeFilterRemove:hover { background:#29443d; color:#8bd5ca; border-color:#8bd5ca; }
 QScrollArea#selectedTagScroll { background:transparent; border:0; }
 QScrollArea#selectedTagScroll QWidget#qt_scrollarea_viewport { background:transparent; }
-QListWidget#batchAvailableTags { background:#111111; border:1px solid #293346; border-radius:4px; color:#d5dedb; outline:0; }
-QListWidget#batchAvailableTags::item { padding:7px 9px; border-bottom:1px solid #252525; min-height:25px; }
-QListWidget#batchAvailableTags::item:hover { background:#1b2926; color:#8bd5ca; }
-QListWidget#batchAvailableTags::item:selected { background:#20352f; color:#8bd5ca; border-left:3px solid #8bd5ca; }
-QListWidget#batchDetailTags { background:#141a24; border:1px solid #293346; border-radius:8px; }
+QListWidget#batchAvailableTags { background:rgba(30, 42, 57, 175); border:1px solid #34495e; border-radius:8px; color:#dce7f1; outline:0; padding:4px; }
+QListWidget#batchAvailableTags::item { background:rgba(63, 83, 106, 65); border:1px solid rgba(115, 145, 172, 65); border-radius:7px; padding:8px 10px; margin:2px; min-height:25px; }
+QListWidget#batchAvailableTags::item:hover { background:rgba(87, 128, 155, 95); color:#b9e8e2; border-color:#6f9bb5; }
+QListWidget#batchAvailableTags::item:selected { background:rgba(76, 134, 128, 95); color:#c8f4ec; border:1px solid #7cc9bd; }
+QListWidget#batchDetailTags { background:rgba(23, 31, 44, 160); border:1px solid #35465a; border-radius:10px; padding:5px; }
+QListWidget#batchDetailTags::item { border:0; border-radius:0; background:transparent; padding:0; margin:0; min-height:20px; }
+QListWidget#batchDetailTags::item:selected { background:transparent; border:0; }
+QListWidget#batchDetailTags::item:hover { background:transparent; border:0; }
 QListWidget#startupHistory { background:#141a24; border:1px solid #293346; border-radius:8px; padding:3px; }
 QListWidget#startupHistory::item { padding:4px 8px; margin:1px; border-radius:5px; color:#dce3ef; }
 QListWidget#startupHistory::item:hover { background:#222d3d; }
 QListWidget#startupHistory::item:selected { background:#253747; border:1px solid #8bd5ca; }
-QListWidget#batchDetailTags::item { padding:8px; border-bottom:1px solid #293346; }
 QFrame#card, QFrame#footer { background:#181d28; border:1px solid #2a3242; border-radius:12px; }
 QFrame#tagChipInclude { background:#1b342f; border:1px solid #397d6d; border-radius:5px; }
 QFrame#tagChipExclude { background:#35242a; border:1px solid #79505a; border-radius:5px; }
